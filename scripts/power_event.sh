@@ -18,14 +18,31 @@ STATE_FILE="/tmp/power_outage_time"
 # Detectar estado (1 = AC conectado, 0 = Batería)
 STATE=$(cat /sys/class/power_supply/AC/online 2>/dev/null || cat /sys/class/power_supply/ACAD/online 2>/dev/null)
 
-# Función para enviar mensajes a Telegram con reintentos
+# Función para enviar mensajes a Telegram de forma sincrónica.
+# Antes se ejecutaba en subshell en segundo plano (&), pero systemd-run --no-block
+# ya desacopla el script de udev. El backgrounding causaba que systemd matara el
+# proceso curl hijo al destruir el cgroup antes de que completara el envío.
 send_telegram() {
     local MESSAGE="$1"
     local URL="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
+    local RETRIES=5
+    local COUNT=0
+    local SUCCESS=0
     
-    until curl -s -X POST "$URL" -d "chat_id=${CHAT_ID}" -d "text=${MESSAGE}" -d "parse_mode=HTML" > /dev/null; do
-        sleep 5
+    while [ $COUNT -lt $RETRIES ]; do
+        # --connect-timeout 5 y --max-time 10 evitan que curl se congele
+        if curl -s --connect-timeout 5 --max-time 10 -X POST "$URL" -d "chat_id=${CHAT_ID}" -d "text=${MESSAGE}" -d "parse_mode=HTML" > /dev/null; then
+            SUCCESS=1
+            break
+        fi
+        COUNT=$((COUNT + 1))
+        sleep 3
     done
+    
+    # Registrar fallo si todos los reintentos fallaron (sin exponer el token)
+    if [ $SUCCESS -eq 0 ]; then
+        logger -t power-monitor "Error: No se pudo enviar notificación Telegram tras $RETRIES intentos (chat_id=${CHAT_ID})"
+    fi
 }
 
 # ==========================================
