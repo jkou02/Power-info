@@ -91,17 +91,17 @@ sudo chmod 600 /etc/power_monitor.env
 Para que Ubuntu invoque este script automáticamente apenas se desconecte o conecte el cargador de la laptop:
 
 	1. Crear el archivo de reglas de `udev`:
-```bash
-sudo nano /etc/udev/rules.d/99-power-supply.rules
-```
+	```bash
+	sudo nano /etc/udev/rules.d/99-power-supply.rules
+	```
 	 2. Se añade esta línea:
-```bash
-SUBSYSTEM=="power_supply", ATTR{online}=="0|1", ACTION=="change", RUN+="/usr/local/bin/power_event.sh"
-```
+	```bash
+	SUBSYSTEM=="power_supply", ATTR{online}=="0|1", ACTION=="change", RUN+="/usr/local/bin/power_event.sh"
+	```
 	 3. Recargar las reglas en el kernel: 
- ```bash
- sudo udevadm control --reload-rules 
- ```
+	 ```bash
+	 sudo udevadm control --reload-rules 
+	 ```
 
 4. Probar la inserción manualmente
 Puedes simular una prueba desconectando el cargador unos segundos y volviéndolo a conectar, o ejecutando manualmente el comando de inserción para comprobar que la base de datos guarde los registros.
@@ -151,24 +151,24 @@ La estructura de las expresiones de `cron` consta de 5 campos:
 Añade una de las siguientes líneas al final del archivo `crontab`:
 
 	1. **Opción A:** Todos los domingos a las 8:00 PM (Reporte semanal)
-```
-0 20 * * 0 /usr/bin/python3 /usr/local/bin/generar_grafico.py >> /var/log/generar_grafico.log 2>&1
-```
+	```
+	0 20 * * 0 /usr/bin/python3 /usr/local/bin/generar_grafico.py >> /var/log/generar_grafico.log 2>&1
+	```
 	2. **Opción B:** El primer día de cada mes a las 9:00 AM (Reporte mensual)
-```
-0 9 1 * * /usr/bin/python3 /usr/local/bin/generar_grafico.py >> /var/log/generar_grafico.log 2>&1
-```
+	```
+	0 9 1 * * /usr/bin/python3 /usr/local/bin/generar_grafico.py >> /var/log/generar_grafico.log 2>&1
+	```
 	3. **Opción C:** Todos los días a las 10:00 PM (Reporte diario)
-```
-0 22 * * * /usr/bin/python3 /usr/local/bin/generar_grafico.py >> /var/log/generar_grafico.log 2>&1
-```
+	```
+	0 22 * * * /usr/bin/python3 /usr/local/bin/generar_grafico.py >> /var/log/generar_grafico.log 2>&1
+	```
 
 4. Guardar y verificar
 	1. Guardar el archivo: En `nano`, presiona `Ctrl + O`, luego `Enter`, y sal con `Ctrl + X`.
 	2. Verificar las tareas activas:
 ```bash
-sudo crontab -l
-```
+	sudo crontab -l
+	```
  
 **Detalle importante en la ejecución:**
 
