@@ -1,11 +1,26 @@
 # Power-info
-## Descripción
-Uso de información de la laptop para identificar cuando se realizan los cortes y reanudación del servicio eléctrico.
 
-## Estructura de proyecto
+Monitorea los cortes y reanudaciones del servicio eléctrico sobre una laptop o equipo con batería, registrando cada evento en una base SQLite y notificando por Telegram. Incluye un script de generación de gráficas para reportes visuales programados vía `cron`.
+
+## Descripción
+
+Power-info usa el subsistema `power_supply` de Linux para detectar cuándo se conecta o desconecta el adaptador de corriente. En cada evento, calcula la duración del corte, lo persiste en SQLite y envía una notificación a Telegram. El script de gráficas produce un reporte visual con la duración diaria de los cortes y su distribución por hora.
+
+> **Importante:** el proyecto está orientado a equipos con batería (laptops o servidores tipo Mini PC con UPS/batería). En un servidor de escritorio sin batería, el evento del subsistema `power_supply` no existe y la regla `udev` nunca disparará.
+
+## Requisitos previos
+
+- **SO:** Ubuntu/Debian (o derivados) con `systemd` y `udev`.
+- **Hardware:** adaptador de corriente detectado por el kernel en `/sys/class/power_supply/` (normalmente `AC` o `ACAD`).
+- **Paquetes:** `sqlite3`, `python3-pandas`, `python3-matplotlib`, `python3-dotenv`, `curl`, `flock` (incluido en `util-linux`).
+- **Telegram:** un bot creado con `@BotFather` y el `chat_id` del destinatario.
+
+## Estructura del proyecto
+
 ```Plaintext
-power-monitor/
+Power-info/
 ├── .gitignore
+├── LICENSE                (MIT)
 ├── README.md
 ├── .env.example
 ├── schema.sql
@@ -14,8 +29,29 @@ power-monitor/
 ├── scripts/
 │   ├── power_event.sh
 │   └── generar_grafico.py
-└── install.sh
+├── install.sh
+└── uninstall.sh
 ```
+
+## Cómo funciona
+
+```
+kernel uevent (power_supply online 0|1)
+        │
+        ▼
+regla udev  →  systemd-run --no-block  →  power_event.sh
+                  (desacopla del worker de udev)        │
+                                                        ├─ flock /var/lock/power_monitor.lock
+                                                        ├─ STATE_FILE /tmp/power_outage_time (deduplica los 2 uevents duales)
+                                                        ├─ INSERT en SQLite (/var/db/power_events.db)
+                                                        └─ POST a Telegram (sendMessage)
+```
+
+- **udev + systemd-run:** la regla `99-power-supply.rules` dispara `systemd-run --no-block` para que el script no muera con el cgroup temporal del worker de udev.
+- **Deduplicación:** el kernel puede emitir dos `uevents` por cada maniobra (conexión/desconexión); el `STATE_FILE` y `flock` garantizan un único registro y un único mensaje por evento real.
+- **Persistencia:** SQLite (`schema.sql`) define la tabla `cortes` con columnas `id`, `inicio`, `fin`, `duracion_seg` y `creado_en`.
+- **Reportes:** `generar_grafico.py` (vía `cron`) lee la base, genera `/tmp/reporte_cortes.png` y lo envía por Telegram con `sendPhoto`.
+
 ## Instalación del sistema
 ### Instalación rápida
 Hacer ejecutable el Script de instalación automática.
@@ -96,7 +132,7 @@ Para que Ubuntu invoque este script automáticamente apenas se desconecte o cone
 	```
 	 2. Se añade esta línea:
 	```bash
-	SUBSYSTEM=="power_supply", ATTR{online}=="0|1", ACTION=="change", RUN+="/usr/local/bin/power_event.sh"
+	SUBSYSTEM=="power_supply", ATTR{online}=="0|1", ACTION=="change", RUN+="/usr/bin/systemd-run --no-block /usr/local/bin/power_event.sh"
 	```
 	 3. Recargar las reglas en el kernel: 
 	 ```bash
@@ -112,8 +148,8 @@ sqlite3 /var/db/power_events.db "SELECT * FROM cortes;"
 #### Instalar sistema de gráficos
 1. Dependencias necesarias
 Asegúrate de tener instalados los paquetes de lectura de datos y graficado en Ubuntu.
-```bash 
-sudo apt update && sudo apt install python3-pandas python3-matplotlib python3-dotenv -y
+```bash
+sudo apt update && sudo apt install sqlite3 python3-pandas python3-matplotlib python3-dotenv curl -y
 ```
 2. Permisos de ejecución
 Asigna los permisos necesarios para ejecutar.
@@ -172,4 +208,49 @@ Añade una de las siguientes líneas al final del archivo `crontab`:
  
 **Detalle importante en la ejecución:**
 
-Se incluye al final la redirección `>> /var/log/generar_grafico.log 2>&1`. Esto guardará cualquier salida o error en un archivo de registros (log) para que puedas revisar si ocurrió algún problema durante la ejecución desatendida. 
+Se incluye al final la redirección `>> /var/log/generar_grafico.log 2>&1`. Esto guardará cualquier salida o error en un archivo de registros (log) para que puedas revisar si ocurrió algún problema durante la ejecución desatendida.
+
+## Desinstalación
+
+Usa el script `uninstall.sh` incluido en el repositorio.
+
+```bash
+sudo ./uninstall.sh                # Modo seguro (default)
+sudo ./uninstall.sh --purge-config # Elimina también /etc/power_monitor.env
+sudo ./uninstall.sh --purge-data   # Elimina también /var/db/power_events.db
+sudo ./uninstall.sh --all          # Equivale a --purge-config + --purge-data
+sudo ./uninstall.sh -h             # Ayuda
+```
+
+**Modo seguro (por defecto):** elimina los binarios en `/usr/local/bin/` y la regla udev, pero conserva el archivo de configuración (`/etc/power_monitor.env`) y la base de datos (`/var/db/power_events.db`).
+
+**Nota:** los paquetes `apt` instalados (`sqlite3`, `python3-pandas`, `python3-matplotlib`, `python3-dotenv`) **no** se desinstalan automáticamente para no afectar otras herramientas. Si quieres removerlos: `sudo apt remove sqlite3 python3-pandas python3-matplotlib python3-dotenv`.
+
+## Solución de problemas
+
+- **El script no se ejecuta al desconectar/conectar el cargador.**
+  1. Verifica que el kernel detecta tu adaptador: `ls /sys/class/power_supply/`. El nombre suele ser `AC` o `ACAD`.
+  2. Comprueba que la regla está cargada simulando un cambio: `sudo udevadm test --action=change /sys/class/power_supply/ACAD` (sustituye `ACAD` por el nombre real si difiere).
+  3. Recarga las reglas si las editaste: `sudo udevadm control --reload-rules && sudo udevadm trigger`.
+  4. Revisa los servicios generados por `systemd-run`: `journalctl -u 'run-*.service' | grep power_event`.
+
+- **No llegan notificaciones a Telegram.**
+  - El script aborta con `exit 1` si falta `/etc/power_monitor.env`. Verifica que el archivo existe y tiene `BOT_TOKEN` y `CHAT_ID` correctos: `sudo cat /etc/power_monitor.env` (permisos `600`).
+  - Comprueba la conectividad: `curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getMe"` (sustituyendo el token).
+  - Revisa los reintentos y fallos: `journalctl -t power-monitor`.
+  - Los `uevents` duales del kernel son normales: el script los deduplica y deberías ver **un** mensaje por evento real. Si ves menos, revisa la regla udev y `STATE_FILE`.
+
+- **No se generan las gráficas.**
+  - `generar_grafico.py` lee `/etc/power_monitor.env` (`root:600`), por lo que debe correr como `root` (lo cual hace `cron` desde el `crontab` de root).
+  - Verifica que la base tiene datos: `sudo sqlite3 /var/db/power_events.db "SELECT COUNT(*) FROM cortes;"`.
+  - La imagen se guarda en `/tmp/reporte_cortes.png`. Revisa también `/var/log/generar_grafico.log` y la salida de `journalctl`.
+
+- **Hora incorrecta en mensajes / gráficas.**
+  - El script usa la hora del sistema. Ajusta la zona horaria con `sudo timedatectl set-timezone <Region/Ciudad>` y verifica con `timedatectl`.
+
+- **Mensajes duplicados.**
+  - El kernel puede emitir 2 `uevents` por maniobra. El script los deduplica mediante `flock` y `STATE_FILE`; si aún ves duplicados, revisa que la regla udev esté usando exactamente `systemd-run --no-block` (no invocar el script directamente desde `udev`).
+
+## Licencia
+
+MIT. Consulta el archivo `LICENSE` para el texto completo. 
