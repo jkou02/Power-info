@@ -150,6 +150,7 @@ activemq-data/
 *.sage.py
 
 # Environments
+*.env
 .env
 .envrc
 .venv
@@ -218,3 +219,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Base de datos y logs locales
+*.db
+*.log
+power_outage_time
+
+# Imágenes/reportes temporales
+*.png
+
+# Byte-compiled / Python
+__pycache__/
+*.py[cod]
