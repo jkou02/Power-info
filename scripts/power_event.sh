@@ -15,6 +15,18 @@ fi
 
 STATE_FILE="/tmp/power_outage_time"
 
+# ==========================================
+# SERIALIZACIÓN: Lock global para evitar ejecución concurrente
+# El kernel emite 2 uevents por desconexión/reconexión, causando que udev lance
+# 2 instancias concurrentes de este script. flock serializa la ejecución.
+# ==========================================
+LOCK_FILE="/var/lock/power_monitor.lock"
+exec 200>"$LOCK_FILE"
+if ! flock -w 60 200; then
+    logger -t power-monitor "No se pudo adquirir el lock; instancia terminada"
+    exit 1
+fi
+
 # Detectar estado (1 = AC conectado, 0 = Batería)
 STATE=$(cat /sys/class/power_supply/AC/online 2>/dev/null || cat /sys/class/power_supply/ACAD/online 2>/dev/null)
 
@@ -51,6 +63,12 @@ send_telegram() {
 
 if [ "$STATE" -eq 0 ]; then
     # --- 1. CORTE DE ELECTRICIDAD ---
+    # Deduplicación: si STATE_FILE ya existe, es el segundo uevent duplicado del kernel
+    if [ -f "$STATE_FILE" ]; then
+        logger -t power-monitor "Evento de corte duplicado ignorado"
+        exit 0
+    fi
+
     START_EPOCH=$(date +%s)
     START_TIME_ISO=$(date +"%Y-%m-%d %H:%M:%S")
     START_TIME_HUMAN=$(date +"%d/%m/%Y a las %I:%M:%S %p")
@@ -88,11 +106,12 @@ elif [ "$STATE" -eq 1 ]; then
         sqlite3 "$DB_PATH" "INSERT INTO cortes (inicio, fin, duracion_seg) VALUES ('$START_TIME_ISO', '$END_TIME_ISO', $DURATION_SECONDS);"
 
         rm -f "$STATE_FILE"
-    else
-        START_TIME_HUMAN="Desconocida"
-        DURATION_TXT="Tiempo no registrado"
-    fi
 
-    MSG="⚡ <b>¡Servicio eléctrico restaurado!</b>%0A%0A📅 <b>Restaurado:</b> ${END_TIME_HUMAN}%0A🕒 <b>Duración del corte:</b> ${DURATION_TXT}"
-    send_telegram "$MSG"
+        MSG="⚡ <b>¡Servicio eléctrico restaurado!</b>%0A%0A📅 <b>Restaurado:</b> ${END_TIME_HUMAN}%0A🕒 <b>Duración del corte:</b> ${DURATION_TXT}"
+        send_telegram "$MSG"
+    else
+        # Sin STATE_FILE no hay corte abierto registrado. Esto ocurre cuando el segundo
+        # uevent duplicado del kernel dispara esta rama tras haber procesado ya la reconexión.
+        logger -t power-monitor "Reconexión sin corte registrado; nada que reportar"
+    fi
 fi
