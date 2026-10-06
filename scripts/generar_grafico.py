@@ -35,7 +35,9 @@ load_env(ENV_FILE)
 
 DB_PATH = os.getenv("DB_PATH", "/var/db/power_events.db")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+# CHAT_ID soporta múltiples destinatarios separados por comas: "id1,id2,id3"
+CHAT_ID_RAW = os.getenv("CHAT_ID", "")
+CHAT_IDS = [cid.strip() for cid in CHAT_ID_RAW.split(",") if cid.strip()]
 
 # ==========================================
 # GENERAR GRÁFICAS Y ENVIAR REPORTES
@@ -85,17 +87,23 @@ def generar_reporte():
     plt.close()
     print(f"Gráfico generado exitosamente en: {OUTPUT_IMAGE}")
 
-    # Enviar foto por Telegram si están definidos BOT_TOKEN y CHAT_ID
-    if BOT_TOKEN and CHAT_ID:
+    # Enviar foto por Telegram a cada destinatario si están definidos BOT_TOKEN y CHAT_IDS
+    if BOT_TOKEN and CHAT_IDS:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-        cmd = [
-            "curl", "-s", "-X", "POST", url,
-            "-F", f"chat_id={CHAT_ID}",
-            "-F", f"photo=@{OUTPUT_IMAGE}",
-            "-F", "caption=📊 Reporte visual de cortes del servicio eléctrico"
-        ]
-        subprocess.run(cmd)
-        print("Reporte enviado a Telegram correctamente.")
+        for chat_id in CHAT_IDS:
+            try:
+                cmd = [
+                    "curl", "-s", "-X", "POST", url,
+                    "-F", f"chat_id={chat_id}",
+                    "-F", f"photo=@{OUTPUT_IMAGE}",
+                    "-F", "caption=📊 Reporte visual de cortes del servicio eléctrico"
+                ]
+                subprocess.run(cmd, check=True)
+                print(f"Reporte enviado a Telegram correctamente (chat_id={chat_id}).")
+            except subprocess.CalledProcessError as e:
+                print(f"Error al enviar reporte a Telegram (chat_id={chat_id}): {e}")
+            except Exception as e:
+                print(f"Error inesperado al enviar a Telegram (chat_id={chat_id}): {e}")
     else:
         print("Advertencia: BOT_TOKEN o CHAT_ID no están configurados en el .env.")
 

@@ -13,7 +13,7 @@ Power-info usa el subsistema `power_supply` de Linux para detectar cuándo se co
 - **SO:** Ubuntu/Debian (o derivados) con `systemd` y `udev`.
 - **Hardware:** adaptador de corriente detectado por el kernel en `/sys/class/power_supply/` (normalmente `AC` o `ACAD`).
 - **Paquetes:** `sqlite3`, `python3-pandas`, `python3-matplotlib`, `python3-dotenv`, `curl`, `flock` (incluido en `util-linux`).
-- **Telegram:** un bot creado con `@BotFather` y el `chat_id` del destinatario.
+- **Telegram:** un bot creado con `@BotFather` y el/los `chat_id` de los destinatarios (admite varios en `CHAT_ID`, separados por comas).
 
 ## Estructura del proyecto
 
@@ -50,7 +50,7 @@ regla udev  →  systemd-run --no-block  →  power_event.sh
 - **udev + systemd-run:** la regla `99-power-supply.rules` dispara `systemd-run --no-block` para que el script no muera con el cgroup temporal del worker de udev.
 - **Deduplicación:** el kernel puede emitir dos `uevents` por cada maniobra (conexión/desconexión); el `STATE_FILE` y `flock` garantizan un único registro y un único mensaje por evento real.
 - **Persistencia:** SQLite (`schema.sql`) define la tabla `cortes` con columnas `id`, `inicio`, `fin`, `duracion_seg` y `creado_en`.
-- **Reportes:** `generar_grafico.py` (vía `cron`) lee la base, genera `/tmp/reporte_cortes.png` y lo envía por Telegram con `sendPhoto`.
+- **Reportes:** `generar_grafico.py` (vía `cron`) lee la base, genera `/tmp/reporte_cortes.png` y lo envía por Telegram con `sendPhoto` a cada destinatario configurado en `CHAT_ID`.
 
 ## Instalación del sistema
 ### Instalación rápida
@@ -123,6 +123,28 @@ Agrega los valores de tus credenciales. Por último, ajusta los permisos para qu
 sudo chmod 600 /etc/power_monitor.env
 ``` 
 
+#### Notificaciones a varias personas
+
+`CHAT_ID` admite uno o varios destinatarios separados por comas. Un solo valor sigue funcionando igual; para notificar a varios chats usa la forma con comas.
+
+```bash
+CHAT_ID="12345,67890,11111"
+```
+
+Aplica a ambos flujos: los mensajes de corte/reanudación (`power_event.sh`) y el reporte gráfico semanal (`generar_grafico.py`). Cada destinatario recibe el aviso por su chat privado con el bot; si el envío a uno falla, los demás reciben igual y el fallo queda registrado en `journalctl -t power-monitor` indicando el `chat_id`.
+
+**Requisito por destinatario:** cada persona debe haber enviado `/start` al bot antes (así habilita el chat privado), y tú necesitas obtener su `chat_id`. Para varios destinatarios el procedimiento es el mismo, repetido por chat:
+
+1. Pide a cada persona que abra el bot en Telegram y le envíe `/start`.
+2. Lista los mensajes recibidos por el bot hasta ahora:
+
+```bash
+curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates" | python3 -m json.tool
+```
+
+3. En el JSON, busca el campo `"chat":{"id": <numero>, ...}` de cada persona y copia el número (puede ser positivo para usuarios o negativo para grupos).
+4. Junta todos los `chat_id` en `CHAT_ID` separados por comas, sin espacios.
+
 3. Configuración del evento en `udev` (Ejecución automática)
 Para que Ubuntu invoque este script automáticamente apenas se desconecte o conecte el cargador de la laptop:
 
@@ -163,7 +185,7 @@ Ejecutar el script manualmente.
 ```bash
 python3 /usr/local/bin/generar_grafico.py
 ```
-Si la base de datos tiene registros, se generará el archivo `/tmp/reporte_cortes.png` y te llegará una foto con las gráficas al chat de Telegram.
+Si la base de datos tiene registros, se generará el archivo `/tmp/reporte_cortes.png` y les llegará una foto con las gráficas al chat de Telegram de cada destinatario configurado en `CHAT_ID`.
 #### Configurar cron para tarea programada
 1. Abrir la tabla de tareas de `cron` (`crontab`)
 Como el script lee la base de datos ubicada en `/var/db/power_events.db` y accede a `/etc/power_monitor.env`, es recomendable agregarlo al `crontab` del usuario `root` o del usuario con permisos suficientes:
@@ -238,6 +260,7 @@ sudo ./uninstall.sh -h             # Ayuda
   - El script aborta con `exit 1` si falta `/etc/power_monitor.env`. Verifica que el archivo existe y tiene `BOT_TOKEN` y `CHAT_ID` correctos: `sudo cat /etc/power_monitor.env` (permisos `600`).
   - Comprueba la conectividad: `curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getMe"` (sustituyendo el token).
   - Revisa los reintentos y fallos: `journalctl -t power-monitor`.
+  - Si usas varios destinatarios, confirma que `CHAT_ID` tenga el formato exacto `id1,id2,id3` (sin espacios extra ni comillas sueltas) y que cada persona haya enviado `/start` al bot; sin ese paso el bot no puede escribirle.
   - Los `uevents` duales del kernel son normales: el script los deduplica y deberías ver **un** mensaje por evento real. Si ves menos, revisa la regla udev y `STATE_FILE`.
 
 - **No se generan las gráficas.**
