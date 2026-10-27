@@ -20,6 +20,12 @@ BIN_GRAFICOS_PY="/usr/local/bin/generar_graficos.py"
 RULE_FILE="/etc/udev/rules.d/99-power-supply.rules"
 ENV_FILE="/etc/power_monitor.env"
 DB_FILE="/var/db/power_events.db"
+TIMER_UNIT="power-info-flush.timer"
+SERVICE_UNIT="power-info-flush.service"
+QUEUE_DIR="/var/lib/power-info"
+RUNTIME_DIR="/run/power-info"
+LEGACY_LOCK="/var/lock/power_monitor.lock"
+LEGACY_STATE="/tmp/power_outage_time"
 
 # Flags
 PURGE_CONFIG=false
@@ -120,7 +126,26 @@ fi
 
 echo ""
 
-# 3. Manejar configuración (si --purge-config o --all)
+# 3. Eliminar timer de reintentos y directorios de trabajo
+echo "🔁 Eliminando timer de reintentos..."
+if systemctl list-unit-files "$TIMER_UNIT" >/dev/null 2>&1; then
+    sudo systemctl disable --now "$TIMER_UNIT" 2>/dev/null || true
+fi
+sudo rm -f "/etc/systemd/system/$SERVICE_UNIT" "/etc/systemd/system/$TIMER_UNIT"
+sudo systemctl daemon-reload
+sudo systemctl reset-failed "$SERVICE_UNIT" 2>/dev/null || true
+echo -e "   ${GREEN}✓${NC} Timer de reintentos eliminado"
+
+if [ -d "$QUEUE_DIR" ]; then
+    sudo rm -rf "$QUEUE_DIR"
+    echo -e "   ${GREEN}✓${NC} Cola de notificaciones eliminada ($QUEUE_DIR)"
+fi
+sudo rm -rf "$RUNTIME_DIR"
+sudo rm -f "$LEGACY_LOCK" "$LEGACY_STATE"
+
+echo ""
+
+# 4. Manejar configuración (si --purge-config o --all)
 if [ "$PURGE_CONFIG" = true ]; then
     echo "🔑 Eliminando archivo de configuración..."
     if [ -f "$ENV_FILE" ]; then
@@ -137,7 +162,7 @@ fi
 
 echo ""
 
-# 4. Manejar base de datos (si --purge-data o --all)
+# 5. Manejar base de datos (si --purge-data o --all)
 if [ "$PURGE_DATA" = true ]; then
     echo "🗄️  Eliminando base de datos..."
     
@@ -169,7 +194,7 @@ fi
 
 echo ""
 
-# 5. Mensaje final
+# 6. Mensaje final
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo -e "${GREEN}✅ Desinstalación completada${NC}"
 echo ""

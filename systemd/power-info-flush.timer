@@ -1,0 +1,11 @@
+[Unit]
+Description=Power-info: reintento periódico de notificaciones de Telegram
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Unit=power-info-flush.service
+
+[Install]
+WantedBy=timers.target

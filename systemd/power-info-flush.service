@@ -1,0 +1,8 @@
+[Unit]
+Description=Power-info: reintentar notificaciones pendientes de Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/power_event.sh --flush-queue

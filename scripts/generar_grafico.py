@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import json
 import sqlite3
 import subprocess
 import pandas as pd
@@ -92,16 +93,27 @@ def generar_reporte():
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
         for chat_id in CHAT_IDS:
             try:
-                cmd = [
-                    "curl", "-s", "-X", "POST", url,
-                    "-F", f"chat_id={chat_id}",
-                    "-F", f"photo=@{OUTPUT_IMAGE}",
-                    "-F", "caption=📊 Reporte visual de cortes del servicio eléctrico"
-                ]
-                subprocess.run(cmd, check=True)
-                print(f"Reporte enviado a Telegram correctamente (chat_id={chat_id}).")
-            except subprocess.CalledProcessError as e:
-                print(f"Error al enviar reporte a Telegram (chat_id={chat_id}): {e}")
+                result = subprocess.run(
+                    [
+                        "curl", "-sS", "--max-time", "30",
+                        "-w", "\n%{http_code}", "-X", "POST", url,
+                        "-F", f"chat_id={chat_id}",
+                        "-F", f"photo=@{OUTPUT_IMAGE}",
+                        "-F", "caption=📊 Reporte visual de cortes del servicio eléctrico"
+                    ],
+                    capture_output=True, text=True
+                )
+                raw = result.stdout
+                code = raw.rsplit("\n", 1)[-1].strip()
+                body = raw.rsplit("\n", 1)[0]
+                try:
+                    respuesta = json.loads(body)
+                except Exception:
+                    respuesta = {}
+                if code == "200" and respuesta.get("ok") is True:
+                    print(f"Reporte enviado a Telegram correctamente (chat_id={chat_id}).")
+                else:
+                    print(f"Error al enviar reporte a Telegram (chat_id={chat_id}, HTTP {code}): {body[:300]}")
             except Exception as e:
                 print(f"Error inesperado al enviar a Telegram (chat_id={chat_id}): {e}")
     else:

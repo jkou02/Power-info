@@ -14,7 +14,12 @@ if ! [[ "$IDS" =~ ^-?[0-9]+(,-?[0-9]+)*$ ]]; then
     exit 1
 fi
 
-REPO=/home/serverjkou/Power-info
+if [ "$(id -u)" -ne 0 ]; then
+    echo "❌ Ejecuta este script con sudo." >&2
+    exit 1
+fi
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "== Copiando scripts =="
 cp "$REPO/scripts/power_event.sh" /usr/local/bin/
@@ -24,6 +29,16 @@ chmod +x /usr/local/bin/power_event.sh /usr/local/bin/generar_grafico.py
 echo "== Validando sintaxis =="
 bash -n /usr/local/bin/power_event.sh
 python3 -m py_compile /usr/local/bin/generar_grafico.py
+
+echo "== Preparando cola y timer de reintentos =="
+mkdir -p /var/lib/power-info/queue /run/power-info
+chmod 700 /var/lib/power-info/queue
+chmod 755 /run/power-info
+rm -f /var/lock/power_monitor.lock /tmp/power_outage_time
+cp "$REPO/systemd/power-info-flush.service" /etc/systemd/system/
+cp "$REPO/systemd/power-info-flush.timer" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now power-info-flush.timer
 
 echo "== Actualizando /etc/power_monitor.env (con respaldo) =="
 BAK="/etc/power_monitor.env.bak.$(date +%Y%m%d%H%M%S)"
@@ -39,9 +54,18 @@ if [ "$2" = "--probar" ]; then
     . /etc/power_monitor.env
     IFS=',' read -ra ARR <<< "$CHAT_ID"
     for cid in "${ARR[@]}"; do
-        code=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST \
+        cid=$(echo "$cid" | xargs)
+        RESP=$(curl -s --max-time 15 -w $'\n%{http_code}' -X POST \
             "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${cid}" -d "text=✅ Power-info: prueba de notificaciones múltiples")
-        echo "  chat_id ${cid} -> HTTP ${code} (200 = recibido)"
+            --data-urlencode "chat_id=${cid}" \
+            --data-urlencode "text=✅ Power-info: prueba de notificaciones múltiples")
+        CODE=${RESP##*$'\n'}
+        BODY=${RESP%$'\n'*}
+        DESC=$(printf '%s' "$BODY" | sed -n 's/.*"description":"\([^"]*\)".*/\1/p' | head -n1)
+        if [ "$CODE" = "200" ] && printf '%s' "$BODY" | grep -qE '"ok"[[:space:]]*:[[:space:]]*true'; then
+            echo "  chat_id ${cid} -> HTTP 200 (recibido)"
+        else
+            echo "  chat_id ${cid} -> HTTP ${CODE} ${DESC:+— $DESC}"
+        fi
     done
 fi
