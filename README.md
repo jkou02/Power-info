@@ -26,9 +26,13 @@ Power-info/
 ├── schema.sql
 ├── rules/
 │   └── 99-power-supply.rules
+├── systemd/
+│   ├── power-info-flush.service
+│   └── power-info-flush.timer
 ├── scripts/
 │   ├── power_event.sh
-│   └── generar_grafico.py
+│   ├── generar_grafico.py
+│   └── diagnostico.sh
 ├── install.sh
 └── uninstall.sh
 ```
@@ -39,16 +43,26 @@ Power-info/
 kernel uevent (power_supply online 0|1)
         │
         ▼
-regla udev  →  systemd-run --no-block  →  power_event.sh
+regla udev  →  systemd-run --no-block  →  power_event.sh (root)
                   (desacopla del worker de udev)        │
-                                                        ├─ flock /var/lock/power_monitor.lock
-                                                        ├─ STATE_FILE /tmp/power_outage_time (deduplica los 2 uevents duales)
+                                                        ├─ flock /run/power-info/power_event.lock
+                                                        ├─ estado /run/power-info/outage_state (deduplica los 2 uevents duales)
                                                         ├─ INSERT en SQLite (/var/db/power_events.db)
                                                         └─ POST a Telegram (sendMessage)
+                                                                 │ si no hay red
+                                                                 ▼
+                                              cola /var/lib/power-info/queue
+                                                                 │
+                                              power-info-flush.timer (cada 1 min)
+                                                                 ▼
+                                                         reintento vía Telegram
 ```
 
 - **udev + systemd-run:** la regla `99-power-supply.rules` dispara `systemd-run --no-block` para que el script no muera con el cgroup temporal del worker de udev.
-- **Deduplicación:** el kernel puede emitir dos `uevents` por cada maniobra (conexión/desconexión); el `STATE_FILE` y `flock` garantizan un único registro y un único mensaje por evento real.
+- **Ejecución como root:** el script exige `uid 0`. El lock y el estado viven en `/run/power-info` (propiedad de root), de modo que una ejecución manual sin `sudo` no puede envenenarlos.
+- **Deduplicación:** el kernel puede emitir dos `uevents` por cada maniobra (conexión/desconexión); el `flock` y una ventana de 15 s sobre `outage_state` garantizan un único registro y un único mensaje por evento real.
+- **Cola de notificaciones:** durante un corte la red suele estar caída (el router también se apaga). Si el envío falla por un problema transitorio, el mensaje se guarda en `/var/lib/power-info/queue` y `power-info-flush.timer` lo reintenta cada minuto (también tras un reinicio) hasta entregarlo o descartarlo si el error es permanente (token inválido, chat inexistente, bot bloqueado).
+- **Errores visibles:** solo se considera entregado un mensaje cuando Telegram responde `HTTP 200` con `"ok":true`. Cualquier `401/400/403/5xx` queda registrado en `journalctl -t power-monitor` con su descripción.
 - **Persistencia:** SQLite (`schema.sql`) define la tabla `cortes` con columnas `id`, `inicio`, `fin`, `duracion_seg` y `creado_en`.
 - **Reportes:** `generar_grafico.py` (vía `cron`) lee la base, genera `/tmp/reporte_cortes.png` y lo envía por Telegram con `sendPhoto` a cada destinatario configurado en `CHAT_ID`.
 
@@ -161,7 +175,18 @@ Para que Ubuntu invoque este script automáticamente apenas se desconecte o cone
 	 sudo udevadm control --reload-rules 
 	 ```
 
-4. Probar la inserción manualmente
+4. Instalar el timer de reintentos
+Copia las unidades de `systemd` y actívalas (reintenta cada minuto los mensajes que quedaron en cola):
+
+```bash
+sudo mkdir -p /var/lib/power-info/queue /run/power-info
+sudo chmod 700 /var/lib/power-info/queue
+sudo cp systemd/power-info-flush.service systemd/power-info-flush.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now power-info-flush.timer
+```
+
+5. Probar la inserción manualmente
 Puedes simular una prueba desconectando el cargador unos segundos y volviéndolo a conectar, o ejecutando manualmente el comando de inserción para comprobar que la base de datos guarde los registros.
 
 ```bash
@@ -257,11 +282,21 @@ sudo ./uninstall.sh -h             # Ayuda
   4. Revisa los servicios generados por `systemd-run`: `journalctl -u 'run-*.service' | grep power_event`.
 
 - **No llegan notificaciones a Telegram.**
-  - El script aborta con `exit 1` si falta `/etc/power_monitor.env`. Verifica que el archivo existe y tiene `BOT_TOKEN` y `CHAT_ID` correctos: `sudo cat /etc/power_monitor.env` (permisos `600`).
-  - Comprueba la conectividad: `curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getMe"` (sustituyendo el token).
-  - Revisa los reintentos y fallos: `journalctl -t power-monitor`.
-  - Si usas varios destinatarios, confirma que `CHAT_ID` tenga el formato exacto `id1,id2,id3` (sin espacios extra ni comillas sueltas) y que cada persona haya enviado `/start` al bot; sin ese paso el bot no puede escribirle.
-  - Los `uevents` duales del kernel son normales: el script los deduplica y deberías ver **un** mensaje por evento real. Si ves menos, revisa la regla udev y `STATE_FILE`.
+  - Ejecuta el diagnóstico (verifica token, destinatarios y estado interno sin mostrar el token):
+    ```bash
+    sudo ./scripts/diagnostico.sh --enviar
+    ```
+  - El script aborta si falta `/etc/power_monitor.env` o si `BOT_TOKEN`/`CHAT_ID` están vacíos. Debe ejecutarse como **root**: una ejecución manual sin `sudo` no puede leer el archivo (`600 root`).
+  - Comprueba la conectividad: `sudo bash -c '. /etc/power_monitor.env; curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getMe"'`.
+  - Revisa errores reales de la API y encolados: `journalctl -t power-monitor -n 30`. Un `401 Unauthorized` significa token revocado; `400 chat not found` o `403 bot blocked` indican que el destinatario debe enviar `/start` o desbloquear el bot.
+  - Revisa la cola de pendientes: `sudo ls -la /var/lib/power-info/queue` y el timer: `systemctl status power-info-flush.timer`.
+  - Si usas varios destinatarios, confirma el formato exacto `id1,id2,id3` (sin espacios extra).
+  - Los `uevents` duales del kernel son normales: el script los deduplica y deberías ver **un** mensaje por evento real.
+
+- **`Permission denied` sobre el lock o el evento se descarta solo.**
+  - El lock y el estado viven en `/run/power-info/` y deben ser de root. Comprueba con `sudo ls -la /run/power-info`.
+  - Si aparece `No se pudo adquirir el lock` de forma repetida, hay otra instancia enviando o una ejecución manual colgada: `pgrep -af power_event.sh`.
+  - No ejecutes `power_event.sh` sin `sudo`: ahora se niega explícitamente para no corromper el lock ni el estado.
 
 - **No se generan las gráficas.**
   - `generar_grafico.py` lee `/etc/power_monitor.env` (`root:600`), por lo que debe correr como `root` (lo cual hace `cron` desde el `crontab` de root).
@@ -272,7 +307,8 @@ sudo ./uninstall.sh -h             # Ayuda
   - El script usa la hora del sistema. Ajusta la zona horaria con `sudo timedatectl set-timezone <Region/Ciudad>` y verifica con `timedatectl`.
 
 - **Mensajes duplicados.**
-  - El kernel puede emitir 2 `uevents` por maniobra. El script los deduplica mediante `flock` y `STATE_FILE`; si aún ves duplicados, revisa que la regla udev esté usando exactamente `systemd-run --no-block` (no invocar el script directamente desde `udev`).
+  - El kernel puede emitir 2 `uevents` por maniobra. El script los deduplica mediante `flock` y una ventana de 15 s sobre `/run/power-info/outage_state`; si aún ves duplicados, revisa que la regla udev esté usando exactamente `systemd-run --no-block` (no invocar el script directamente desde `udev`).
+  - Si un mensaje se encoló y además se entregó en el primer intento, revisa `journalctl -u power-info-flush.service`; la cola elimina cada archivo tras un `HTTP 200`.
 
 ## Licencia
 
