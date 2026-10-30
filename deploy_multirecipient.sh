@@ -30,14 +30,19 @@ echo "== Validando sintaxis =="
 bash -n /usr/local/bin/power_event.sh
 python3 -m py_compile /usr/local/bin/generar_grafico.py
 
-echo "== Preparando cola y timer de reintentos =="
+echo "== Preparando estado, cola y servicios =="
 mkdir -p /var/lib/power-info/queue /run/power-info
 chmod 700 /var/lib/power-info/queue
-chmod 755 /run/power-info
+chmod 755 /var/lib/power-info /run/power-info
+if [ -f /run/power-info/outage_state ] && [ ! -f /var/lib/power-info/outage_state ]; then
+    mv /run/power-info/outage_state /var/lib/power-info/outage_state
+fi
 rm -f /var/lock/power_monitor.lock /tmp/power_outage_time
+cp "$REPO/systemd/power-info-boot.service" /etc/systemd/system/
 cp "$REPO/systemd/power-info-flush.service" /etc/systemd/system/
 cp "$REPO/systemd/power-info-flush.timer" /etc/systemd/system/
 systemctl daemon-reload
+systemctl enable --now power-info-boot.service
 systemctl enable --now power-info-flush.timer
 
 echo "== Actualizando /etc/power_monitor.env (con respaldo) =="

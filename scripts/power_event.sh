@@ -4,12 +4,14 @@
 #
 # Uso:
 #   power_event.sh                Procesa el evento actual (lo invoca udev como root).
+#   power_event.sh --boot-check   Reconcilia el estado al arrancar (servicio de arranque).
 #   power_event.sh --flush-queue  Reintenta las notificaciones pendientes (timer).
 #   power_event.sh --help         Muestra esta ayuda.
 #
 # Notas de diseño:
-#   - Debe ejecutarse como root: udev lo lanza con systemd-run y el timer también.
-#   - El lock y el estado viven en /run/power-info (root, no manipulable por otros usuarios).
+#   - Debe ejecutarse como root: udev lo lanza con systemd-run y los servicios también.
+#   - El lock vive en /run/power-info; el estado del corte y la cola en
+#     /var/lib/power-info para sobrevivir a reinicios e hibernaciones.
 #   - Si no hay red (habitual durante un corte), el mensaje se guarda en una cola
 #     persistente y un timer lo reintenta cada minuto hasta entregarlo.
 
@@ -17,14 +19,14 @@ set -u
 
 ENV_FILE="/etc/power_monitor.env"
 RUNTIME_DIR="/run/power-info"
+DATA_DIR="/var/lib/power-info"
 LOCK_FILE="${RUNTIME_DIR}/power_event.lock"
-STATE_FILE="${RUNTIME_DIR}/outage_state"
-QUEUE_DIR="/var/lib/power-info/queue"
+# El estado se guarda en disco para sobrevivir a reinicios y hibernaciones.
+STATE_FILE="${DATA_DIR}/outage_state"
+QUEUE_DIR="${DATA_DIR}/queue"
 LOG_TAG="power-monitor"
 DEFAULT_DB_PATH="/var/db/power_events.db"
 
-# Ventana para descartar los uevents duplicados que emite el kernel.
-DEDUPE_WINDOW=15
 # Espera máxima por el lock. Si otra instancia sigue enviando, esta se descarta.
 LOCK_WAIT=20
 # Reintentos rápidos antes de encolar (solo para fallos transitorios).
@@ -44,6 +46,7 @@ usage() {
 Uso: $0 [OPCIÓN]
 
   (sin opciones)    Procesa el evento de energía actual.
+  --boot-check      Reconcilia el estado tras un reinicio (servicio de arranque).
   --flush-queue     Reintenta las notificaciones pendientes de la cola.
   --help            Muestra esta ayuda.
 EOF
@@ -79,11 +82,11 @@ load_env() {
 }
 
 prepare_dirs() {
-    mkdir -p "$RUNTIME_DIR" || {
-        log "Error: no se pudo crear $RUNTIME_DIR" "user.err"
+    mkdir -p "$RUNTIME_DIR" "$DATA_DIR" || {
+        log "Error: no se pudieron crear $RUNTIME_DIR / $DATA_DIR" "user.err"
         exit 1
     }
-    chmod 755 "$RUNTIME_DIR" 2>/dev/null || true
+    chmod 755 "$RUNTIME_DIR" "$DATA_DIR" 2>/dev/null || true
 }
 
 acquire_lock() {
@@ -228,19 +231,32 @@ send_telegram() {
 flush_queue() {
     local file chat_id message rc count=0
     local sent=0 kept=0 discarded=0
+    local -a pending
 
-    mkdir -p "$QUEUE_DIR" 2>/dev/null || exit 1
+    mkdir -p "$QUEUE_DIR" 2>/dev/null || return 1
     chmod 700 "$QUEUE_DIR" 2>/dev/null || true
+
+    # Latido: mientras haya un corte abierto se actualiza su mtime. Si el equipo
+    # se apaga o hiberna, ese sello es la última hora en que estuvo encendido.
+    if is_outage_open; then
+        touch "$STATE_FILE" 2>/dev/null || true
+    else
+        discard_invalid_state || true
+    fi
 
     # Descartar entradas demasiado antiguas para no acumular basura.
     find "$QUEUE_DIR" -maxdepth 1 -name '*.msg' -mtime +7 -delete 2>/dev/null || true
 
+    shopt -s nullglob
+    pending=("$QUEUE_DIR"/*.msg)
+    # Sin pendientes no hace falta comprobar la red ni despertar al equipo.
+    [ ${#pending[@]} -eq 0 ] && return 0
+
     if ! network_up; then
-        exit 0
+        return 0
     fi
 
-    shopt -s nullglob
-    for file in "$QUEUE_DIR"/*.msg; do
+    for file in "${pending[@]}"; do
         [ "$count" -ge 50 ] && break
         count=$((count + 1))
 
@@ -274,60 +290,93 @@ flush_queue() {
     fi
 }
 
-is_duplicate_outage() {
-    local now="$1"
+is_outage_open() {
     local previous
 
     [ -f "$STATE_FILE" ] || return 1
-
     previous=$(head -n1 "$STATE_FILE" 2>/dev/null)
-    if [[ "$previous" =~ ^[0-9]+$ ]] && [ $((now - previous)) -lt "$DEDUPE_WINDOW" ]; then
-        return 0
-    fi
-
-    return 1
+    [[ "$previous" =~ ^[0-9]+$ ]] || return 1
+    return 0
 }
 
-handle_outage() {
-    local now start_iso start_human message
+# Guarda el estado del corte de forma atómica: se escribe en un temporal y se
+# renombra. Así una interrupción a mitad de escritura nunca deja un estado
+# vacío o truncado que luego parezca un corte abierto.
+write_state() {
+    local inicio_epoch="$1" inicio_human="$2" inicio_iso="$3" tmp
 
-    now=$(date +%s)
+    tmp=$(mktemp "${DATA_DIR}/.outage_state.XXXXXX" 2>/dev/null) || {
+        log "Error: no se pudo crear el temporal del estado" "user.err"
+        return 1
+    }
 
-    if is_duplicate_outage "$now"; then
-        log "Evento de corte duplicado ignorado"
-        exit 0
+    if ! printf '%s\n%s\n%s\n' "$inicio_epoch" "$inicio_human" "$inicio_iso" > "$tmp"; then
+        rm -f "$tmp"
+        log "Error: no se pudo escribir el estado del corte" "user.err"
+        return 1
     fi
 
-    if [ -f "$STATE_FILE" ]; then
-        log "Corte previo sin cierre detectado; se descarta y se registra el nuevo"
+    chmod 600 "$tmp" 2>/dev/null || true
+
+    if ! mv -f "$tmp" "$STATE_FILE"; then
+        rm -f "$tmp"
+        log "Error: no se pudo guardar el estado del corte" "user.err"
+        return 1
     fi
 
-    start_iso=$(date +"%Y-%m-%d %H:%M:%S")
-    start_human=$(date +"%d/%m/%Y a las %I:%M:%S %p")
-
-    {
-        echo "$now"
-        echo "$start_human"
-        echo "$start_iso"
-    } > "$STATE_FILE"
-    chmod 600 "$STATE_FILE" 2>/dev/null || true
-
-    message=$(printf '⚠️ <b>¡Corte de servicio eléctrico!</b>\n\n📅 <b>Inicio:</b> %s\n🔋 El servidor opera con batería.' "$start_human")
-    send_telegram "$message"
+    return 0
 }
 
-handle_restoration() {
-    local end_epoch end_iso end_human start_epoch start_human start_iso
-    local duration hours minutes seconds duration_txt message
+# Elimina un state vacío o corrupto (p. ej. de una ejecución interrumpida).
+# Devuelve 0 solo si realmente lo eliminó.
+discard_invalid_state() {
+    local previous
 
-    end_epoch=$(date +%s)
-    end_iso=$(date +"%Y-%m-%d %H:%M:%S")
-    end_human=$(date +"%d/%m/%Y a las %I:%M:%S %p")
+    [ -e "$STATE_FILE" ] || return 1
+    previous=$(head -n1 "$STATE_FILE" 2>/dev/null)
+    [[ "$previous" =~ ^[0-9]+$ ]] && return 1
 
-    if [ ! -f "$STATE_FILE" ]; then
-        log "Reconexión sin corte registrado; nada que reportar"
-        exit 0
+    log "Estado de corte vacío o corrupto; se descarta" "user.warning"
+    rm -f "$STATE_FILE"
+    return 0
+}
+
+formatear_duracion() {
+    local total="$1"
+    local horas=$((total / 3600))
+    local minutos=$(((total % 3600) / 60))
+    local segundos=$((total % 60))
+    local salida=""
+
+    [ "$horas" -gt 0 ] && salida="${horas}h "
+    [ "$minutos" -gt 0 ] && salida="${salida}${minutos}m "
+    printf '%s' "${salida}${segundos}s"
+}
+
+registrar_corte() {
+    local inicio="$1" fin="$2" duracion="$3"
+
+    if command -v sqlite3 >/dev/null 2>&1; then
+        if ! sqlite3 "$DB_PATH" "INSERT INTO cortes (inicio, fin, duracion_seg) VALUES ('$inicio', '$fin', $duracion);" 2>/dev/null; then
+            log "Error: no se pudo registrar el corte en $DB_PATH" "user.err"
+            return 1
+        fi
+    else
+        log "Error: sqlite3 no está instalado; no se registró el corte" "user.err"
+        return 1
     fi
+
+    return 0
+}
+
+# Cierra el corte abierto con la hora indicada y notifica.
+# modo=normal: restauración detectada en vivo.
+# modo=boot:   cierre estimado tras un reinicio/hibernación.
+cerrar_corte() {
+    local end_epoch="$1" modo="${2:-normal}"
+    local start_epoch start_human start_iso end_iso end_human duration message
+
+    [ -f "$STATE_FILE" ] || return 1
 
     start_epoch=$(head -n1 "$STATE_FILE" 2>/dev/null)
     start_human=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
@@ -336,33 +385,107 @@ handle_restoration() {
     if ! [[ "$start_epoch" =~ ^[0-9]+$ ]]; then
         log "Estado de corte corrupto; se descarta" "user.warning"
         rm -f "$STATE_FILE"
+        return 1
+    fi
+
+    [ "$end_epoch" -lt "$start_epoch" ] && end_epoch="$start_epoch"
+    duration=$((end_epoch - start_epoch))
+
+    end_iso=$(date -d "@$end_epoch" +"%Y-%m-%d %H:%M:%S")
+    end_human=$(date -d "@$end_epoch" +"%d/%m/%Y a las %I:%M:%S %p")
+
+    registrar_corte "$start_iso" "$end_iso" "$duration"
+    rm -f "$STATE_FILE"
+
+    if [ "$modo" = "boot" ]; then
+        message=$(printf '⚡ <b>Servicio eléctrico restaurado</b>\n\n📅 <b>Fin estimado:</b> %s\n🕒 <b>Duración estimada:</b> %s\nℹ️ El equipo estuvo apagado o suspendido durante el corte.' "$end_human" "$(formatear_duracion "$duration")")
+    else
+        message=$(printf '⚡ <b>¡Servicio eléctrico restaurado!</b>\n\n📅 <b>Restaurado:</b> %s\n🕒 <b>Duración del corte:</b> %s' "$end_human" "$(formatear_duracion "$duration")")
+    fi
+
+    send_telegram "$message"
+}
+
+handle_outage() {
+    local now start_iso start_human message
+
+    now=$(date +%s)
+
+    if is_outage_open; then
+        # Segundo uevent del mismo corte o corte que sigue abierto tras un
+        # reinicio: se conserva el inicio original y no se duplica el aviso.
+        touch "$STATE_FILE" 2>/dev/null || true
+        log "Corte ya en curso; se mantiene el estado registrado"
         exit 0
     fi
 
-    duration=$((end_epoch - start_epoch))
-    [ "$duration" -lt 0 ] && duration=0
-
-    hours=$((duration / 3600))
-    minutes=$(((duration % 3600) / 60))
-    seconds=$((duration % 60))
-
-    duration_txt=""
-    [ "$hours" -gt 0 ] && duration_txt="${hours}h "
-    [ "$minutes" -gt 0 ] && duration_txt="${duration_txt}${minutes}m "
-    duration_txt="${duration_txt}${seconds}s"
-
-    if command -v sqlite3 >/dev/null 2>&1; then
-        if ! sqlite3 "$DB_PATH" "INSERT INTO cortes (inicio, fin, duracion_seg) VALUES ('$start_iso', '$end_iso', $duration);" 2>/dev/null; then
-            log "Error: no se pudo registrar el corte en $DB_PATH" "user.err"
-        fi
-    else
-        log "Error: sqlite3 no está instalado; no se registró el corte" "user.err"
+    if [ -f "$STATE_FILE" ] && ! is_outage_open; then
+        discard_invalid_state || true
     fi
 
-    rm -f "$STATE_FILE"
+    start_iso=$(date +"%Y-%m-%d %H:%M:%S")
+    start_human=$(date +"%d/%m/%Y a las %I:%M:%S %p")
 
-    message=$(printf '⚡ <b>¡Servicio eléctrico restaurado!</b>\n\n📅 <b>Restaurado:</b> %s\n🕒 <b>Duración del corte:</b> %s' "$end_human" "$duration_txt")
+    write_state "$now" "$start_human" "$start_iso"
+
+    message=$(printf '⚠️ <b>¡Corte de servicio eléctrico!</b>\n\n📅 <b>Inicio:</b> %s\n🔋 El servidor opera con batería.' "$start_human")
     send_telegram "$message"
+}
+
+handle_restoration() {
+    if [ ! -f "$STATE_FILE" ]; then
+        log "Reconexión sin corte registrado; nada que reportar"
+        exit 0
+    fi
+
+    cerrar_corte "$(date +%s)" normal
+}
+
+# Se ejecuta al arrancar el sistema. Reconcilia el estado que sobrevivió en
+# disco: si el equipo arrancó con batería inicia un corte; si arrancó con
+# corriente y había un corte abierto, lo cierra usando el último latido.
+handle_boot_check() {
+    local state now start_human start_iso last_seen message
+
+    # Un state vacío/corrupto (p. ej. de una ejecución interrumpida) no
+    # representa un corte: se limpia antes de conciliar.
+    discard_invalid_state || true
+
+    state=$(read_ac_state)
+
+    case "$state" in
+        0)
+            if is_outage_open; then
+                touch "$STATE_FILE" 2>/dev/null || true
+                log "Arranque con batería: el corte ya estaba registrado; se mantiene"
+            else
+                now=$(date +%s)
+                start_iso=$(date +"%Y-%m-%d %H:%M:%S")
+                start_human=$(date +"%d/%m/%Y a las %I:%M:%S %p")
+
+                write_state "$now" "$start_human" "$start_iso"
+
+                message=$(printf '⚠️ <b>El equipo arrancó con batería</b>\n\n📅 <b>Detectado:</b> %s\n🔋 Sin conexión a la red eléctrica.\nℹ️ El inicio real del corte pudo ser anterior al arranque.' "$start_human")
+                send_telegram "$message"
+            fi
+            ;;
+        1)
+            if is_outage_open; then
+                last_seen=$(stat -c %Y "$STATE_FILE" 2>/dev/null)
+                [[ "$last_seen" =~ ^[0-9]+$ ]] || last_seen=$(date +%s)
+                log "Arranque con corriente y corte pendiente; se cierra con el último latido ($(date -d "@$last_seen" +"%Y-%m-%d %H:%M:%S"))"
+                cerrar_corte "$last_seen" boot
+            else
+                log "Arranque con corriente; sin corte pendiente"
+            fi
+            ;;
+        *)
+            log "No se pudo leer el estado de energía al arrancar" "user.err"
+            exit 1
+            ;;
+    esac
+
+    flush_queue
 }
 
 main() {
@@ -389,9 +512,17 @@ case "${1:-}" in
     "")
         main
         ;;
+    --boot-check)
+        require_root
+        load_env
+        prepare_dirs
+        acquire_lock
+        handle_boot_check
+        ;;
     --flush-queue)
         require_root
         load_env
+        prepare_dirs
         flush_queue
         ;;
     -h|--help)

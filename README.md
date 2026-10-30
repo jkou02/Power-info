@@ -27,6 +27,7 @@ Power-info/
 ├── rules/
 │   └── 99-power-supply.rules
 ├── systemd/
+│   ├── power-info-boot.service
 │   ├── power-info-flush.service
 │   └── power-info-flush.timer
 ├── scripts/
@@ -46,7 +47,7 @@ kernel uevent (power_supply online 0|1)
 regla udev  →  systemd-run --no-block  →  power_event.sh (root)
                   (desacopla del worker de udev)        │
                                                         ├─ flock /run/power-info/power_event.lock
-                                                        ├─ estado /run/power-info/outage_state (deduplica los 2 uevents duales)
+                                                        ├─ estado /var/lib/power-info/outage_state (sobrevive reinicios)
                                                         ├─ INSERT en SQLite (/var/db/power_events.db)
                                                         └─ POST a Telegram (sendMessage)
                                                                  │ si no hay red
@@ -56,12 +57,17 @@ regla udev  →  systemd-run --no-block  →  power_event.sh (root)
                                               power-info-flush.timer (cada 1 min)
                                                                  ▼
                                                          reintento vía Telegram
+
+al arrancar: power-info-boot.service  →  power_event.sh --boot-check
+              (cierra cortes pendientes o detecta arranque con batería)
 ```
 
 - **udev + systemd-run:** la regla `99-power-supply.rules` dispara `systemd-run --no-block` para que el script no muera con el cgroup temporal del worker de udev.
-- **Ejecución como root:** el script exige `uid 0`. El lock y el estado viven en `/run/power-info` (propiedad de root), de modo que una ejecución manual sin `sudo` no puede envenenarlos.
-- **Deduplicación:** el kernel puede emitir dos `uevents` por cada maniobra (conexión/desconexión); el `flock` y una ventana de 15 s sobre `outage_state` garantizan un único registro y un único mensaje por evento real.
-- **Cola de notificaciones:** durante un corte la red suele estar caída (el router también se apaga). Si el envío falla por un problema transitorio, el mensaje se guarda en `/var/lib/power-info/queue` y `power-info-flush.timer` lo reintenta cada minuto (también tras un reinicio) hasta entregarlo o descartarlo si el error es permanente (token inválido, chat inexistente, bot bloqueado).
+- **Ejecución como root:** el script exige `uid 0`. El lock vive en `/run/power-info` y el estado en `/var/lib/power-info`, ambos de root, de modo que una ejecución manual sin `sudo` no puede envenenarlos.
+- **Deduplicación:** el kernel puede emitir dos `uevents` por cada maniobra. Mientras exista un corte abierto se conserva el estado y no se duplica el aviso; solo al cerrarlo se elimina.
+- **Persistencia del corte:** el estado está en disco (`/var/lib/power-info/outage_state`). Mientras el corte sigue abierto, el timer actualiza su marca de tiempo cada minuto (latido). Si el equipo se apaga o hiberna, al arrancar `power-info-boot.service` cierra el corte con el último latido y avisa con la duración estimada.
+- **Arranque con batería:** si el equipo enciende sin corriente, el servicio de arranque registra y notifica el corte (el inicio real pudo ser anterior).
+- **Cola de notificaciones:** durante un corte la red suele estar caída (el router también se apaga). Si el envío falla por un problema transitorio, el mensaje se guarda en `/var/lib/power-info/queue` y `power-info-flush.timer` lo reintenta cada minuto (también tras un reinicio) hasta entregarlo o descartarlo si el error es permanente (token inválido, chat inexistente, bot bloqueado). Si la cola está vacía no se hace ninguna petición de red.
 - **Errores visibles:** solo se considera entregado un mensaje cuando Telegram responde `HTTP 200` con `"ok":true`. Cualquier `401/400/403/5xx` queda registrado en `journalctl -t power-monitor` con su descripción.
 - **Persistencia:** SQLite (`schema.sql`) define la tabla `cortes` con columnas `id`, `inicio`, `fin`, `duracion_seg` y `creado_en`.
 - **Reportes:** `generar_grafico.py` (vía `cron`) lee la base, genera `/tmp/reporte_cortes.png` y lo envía por Telegram con `sendPhoto` a cada destinatario configurado en `CHAT_ID`.
@@ -175,15 +181,16 @@ Para que Ubuntu invoque este script automáticamente apenas se desconecte o cone
 	 sudo udevadm control --reload-rules 
 	 ```
 
-4. Instalar el timer de reintentos
-Copia las unidades de `systemd` y actívalas (reintenta cada minuto los mensajes que quedaron en cola):
+4. Instalar los servicios de arranque y reintentos
+Copia las unidades de `systemd` y actívalas (reconciliación al arrancar + reintento cada minuto de los mensajes en cola):
 
 ```bash
 sudo mkdir -p /var/lib/power-info/queue /run/power-info
 sudo chmod 700 /var/lib/power-info/queue
-sudo cp systemd/power-info-flush.service systemd/power-info-flush.timer /etc/systemd/system/
+sudo chmod 755 /var/lib/power-info /run/power-info
+sudo cp systemd/power-info-boot.service systemd/power-info-flush.service systemd/power-info-flush.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now power-info-flush.timer
+sudo systemctl enable --now power-info-boot.service power-info-flush.timer
 ```
 
 5. Probar la inserción manualmente
@@ -294,9 +301,18 @@ sudo ./uninstall.sh -h             # Ayuda
   - Los `uevents` duales del kernel son normales: el script los deduplica y deberías ver **un** mensaje por evento real.
 
 - **`Permission denied` sobre el lock o el evento se descarta solo.**
-  - El lock y el estado viven en `/run/power-info/` y deben ser de root. Comprueba con `sudo ls -la /run/power-info`.
+  - El lock vive en `/run/power-info/` y el estado en `/var/lib/power-info/`; ambos deben ser de root. Comprueba con `sudo ls -la /run/power-info /var/lib/power-info`.
   - Si aparece `No se pudo adquirir el lock` de forma repetida, hay otra instancia enviando o una ejecución manual colgada: `pgrep -af power_event.sh`.
   - No ejecutes `power_event.sh` sin `sudo`: ahora se niega explícitamente para no corromper el lock ni el estado.
+
+- **Aparece `outage_state` vacío o corrupto.**
+  - No representa un corte: se descarta automáticamente en la siguiente ejecución (`--boot-check` o el timer) y queda registrado en el journal.
+  - El estado se escribe de forma atómica (temporal + `mv`), así que una interrupción a mitad de escritura ya no puede dejarlo truncado.
+
+- **Falta el aviso de restauración tras apagar o hibernar el equipo.**
+  - El estado del corte se guarda en `/var/lib/power-info/outage_state`; al arrancar, `power-info-boot.service` lo cierra usando el último latido (margen de ~1 min) y envía un mensaje con la duración **estimada**.
+  - Comprueba el servicio: `systemctl status power-info-boot.service` y `journalctl -t power-monitor -n 20`.
+  - Si el equipo arranca con batería, el servicio registra el corte con la hora de detección (no se conoce el inicio real).
 
 - **No se generan las gráficas.**
   - `generar_grafico.py` lee `/etc/power_monitor.env` (`root:600`), por lo que debe correr como `root` (lo cual hace `cron` desde el `crontab` de root).
@@ -307,7 +323,7 @@ sudo ./uninstall.sh -h             # Ayuda
   - El script usa la hora del sistema. Ajusta la zona horaria con `sudo timedatectl set-timezone <Region/Ciudad>` y verifica con `timedatectl`.
 
 - **Mensajes duplicados.**
-  - El kernel puede emitir 2 `uevents` por maniobra. El script los deduplica mediante `flock` y una ventana de 15 s sobre `/run/power-info/outage_state`; si aún ves duplicados, revisa que la regla udev esté usando exactamente `systemd-run --no-block` (no invocar el script directamente desde `udev`).
+  - El kernel puede emitir 2 `uevents` por maniobra. Mientras haya un corte abierto el script conserva el estado y no duplica el aviso; si aún ves duplicados, revisa que la regla udev esté usando exactamente `systemd-run --no-block` (no invocar el script directamente desde `udev`).
   - Si un mensaje se encoló y además se entregó en el primer intento, revisa `journalctl -u power-info-flush.service`; la cola elimina cada archivo tras un `HTTP 200`.
 
 ## Licencia

@@ -22,6 +22,7 @@ ENV_FILE="/etc/power_monitor.env"
 DB_FILE="/var/db/power_events.db"
 TIMER_UNIT="power-info-flush.timer"
 SERVICE_UNIT="power-info-flush.service"
+BOOT_UNIT="power-info-boot.service"
 QUEUE_DIR="/var/lib/power-info"
 RUNTIME_DIR="/run/power-info"
 LEGACY_LOCK="/var/lock/power_monitor.lock"
@@ -126,15 +127,17 @@ fi
 
 echo ""
 
-# 3. Eliminar timer de reintentos y directorios de trabajo
-echo "🔁 Eliminando timer de reintentos..."
+# 3. Eliminar servicios de arranque/reintentos y directorios de trabajo
+echo "🔁 Eliminando servicios de arranque y reintentos..."
 if systemctl list-unit-files "$TIMER_UNIT" >/dev/null 2>&1; then
     sudo systemctl disable --now "$TIMER_UNIT" 2>/dev/null || true
 fi
-sudo rm -f "/etc/systemd/system/$SERVICE_UNIT" "/etc/systemd/system/$TIMER_UNIT"
+sudo systemctl disable --now "$BOOT_UNIT" 2>/dev/null || true
+sudo rm -f "/etc/systemd/system/$SERVICE_UNIT" "/etc/systemd/system/$TIMER_UNIT" "/etc/systemd/system/$BOOT_UNIT"
 sudo systemctl daemon-reload
 sudo systemctl reset-failed "$SERVICE_UNIT" 2>/dev/null || true
-echo -e "   ${GREEN}✓${NC} Timer de reintentos eliminado"
+sudo systemctl reset-failed "$BOOT_UNIT" 2>/dev/null || true
+echo -e "   ${GREEN}✓${NC} Servicios de arranque y reintentos eliminados"
 
 if [ -d "$QUEUE_DIR" ]; then
     sudo rm -rf "$QUEUE_DIR"

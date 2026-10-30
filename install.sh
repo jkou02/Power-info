@@ -30,21 +30,28 @@ sudo mkdir -p /etc/udev/rules.d
 sudo cp rules/99-power-supply.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 
-# 5. Preparar directorios de ejecución y cola de notificaciones
-echo "📬 Preparando cola de notificaciones..."
+# 5. Preparar directorios de ejecución, estado y cola de notificaciones
+echo "📬 Preparando estado y cola de notificaciones..."
 sudo mkdir -p /var/lib/power-info/queue /run/power-info
 sudo chmod 700 /var/lib/power-info/queue
-sudo chmod 755 /run/power-info
+sudo chmod 755 /var/lib/power-info /run/power-info
+
+# Migrar un corte abierto de la versión anterior (estado en /run) sin perderlo.
+if [ -f /run/power-info/outage_state ] && [ ! -f /var/lib/power-info/outage_state ]; then
+    sudo mv /run/power-info/outage_state /var/lib/power-info/outage_state
+fi
 
 # Limpiar restos de versiones anteriores (el lock/estado antiguos vivían en
 # directorios sticky y podían quedar envenenados por una ejecución manual).
 sudo rm -f /var/lock/power_monitor.lock /tmp/power_outage_time
 
-# 6. Instalar el timer que reintenta notificaciones cuando vuelve la red
-echo "🔁 Instalando timer de reintentos..."
+# 6. Instalar el servicio de arranque y el timer de reintentos
+echo "🔁 Instalando servicios de arranque y reintentos..."
+sudo cp systemd/power-info-boot.service /etc/systemd/system/
 sudo cp systemd/power-info-flush.service /etc/systemd/system/
 sudo cp systemd/power-info-flush.timer /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable --now power-info-boot.service
 sudo systemctl enable --now power-info-flush.timer
 
 # 7. Crear archivo .env si no existe

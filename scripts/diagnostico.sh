@@ -8,7 +8,7 @@
 set -u
 
 ENV_FILE="/etc/power_monitor.env"
-STATE_FILE="/run/power-info/outage_state"
+STATE_FILE="/var/lib/power-info/outage_state"
 LOCK_FILE="/run/power-info/power_event.lock"
 QUEUE_DIR="/var/lib/power-info/queue"
 DB_PATH_DEFAULT="/var/db/power_events.db"
@@ -127,11 +127,13 @@ fi
 
 echo
 echo "--- Estado interno ---"
-if [ -f "$STATE_FILE" ]; then
-    EDAD=$(( $(date +%s) - $(stat -c %Y "$STATE_FILE") ))
-    echo "⚠️  $STATE_FILE existe (${EDAD}s de antigüedad): hay un corte abierto o quedó huérfano"
-else
+if [ ! -e "$STATE_FILE" ]; then
     echo "✅ Sin corte abierto ($STATE_FILE no existe)"
+elif [[ "$(head -n1 "$STATE_FILE" 2>/dev/null)" =~ ^[0-9]+$ ]]; then
+    EDAD=$(( $(date +%s) - $(stat -c %Y "$STATE_FILE") ))
+    echo "⚠️  Corte abierto desde $(sed -n '2p' "$STATE_FILE" 2>/dev/null) (latido hace ${EDAD}s)"
+else
+    echo "⚠️  $STATE_FILE está vacío o corrupto (no representa un corte); se limpiará en la próxima ejecución"
 fi
 
 if [ -e "$LOCK_FILE" ]; then
@@ -151,6 +153,12 @@ if systemctl is-enabled power-info-flush.timer >/dev/null 2>&1; then
     echo "Timer de reintentos: $(systemctl is-active power-info-flush.timer) (enabled)"
 else
     echo "⚠️  Timer de reintentos no instalado"
+fi
+
+if systemctl is-enabled power-info-boot.service >/dev/null 2>&1; then
+    echo "Revisión al arranque: $(systemctl is-enabled power-info-boot.service)"
+else
+    echo "⚠️  Servicio de revisión al arranque no instalado"
 fi
 
 if [ -e /tmp/power_outage_time ] || [ -e /var/lock/power_monitor.lock ]; then

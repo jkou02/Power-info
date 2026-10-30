@@ -1,0 +1,11 @@
+[Unit]
+Description=Power-info: conciliar estado de energía al arrancar
+After=local-fs.target
+ConditionPathExists=/usr/local/bin/power_event.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/power_event.sh --boot-check
+
+[Install]
+WantedBy=multi-user.target
